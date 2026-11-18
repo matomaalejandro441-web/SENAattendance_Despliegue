@@ -1,7 +1,7 @@
 import axios from "axios";
 
 const api = axios.create({
-  baseURL: import.meta.env.VITE_API_URL,
+  baseURL: import.meta.env.VITE_API_URL || "http://localhost:8000",
 });
 
 // =====================================================
@@ -24,10 +24,9 @@ export const login = async (typeid, id, password) => {
 };
 
 export const recoverPassword = async (data) => {
-  const response = await axios.post(`${import.meta.env.VITE_API_URL}/users/password`, data);
+  const response = await api.post("/users/password", data);
   return response.data;
 };
-
 
 // =====================================================
 // APRENDICES  (router: /usuarios)

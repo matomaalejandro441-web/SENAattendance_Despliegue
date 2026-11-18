@@ -16,7 +16,7 @@ app = FastAPI()
 
 # 2. IMPORTAMOS LOS ROUTERS (Evita que el limiter bloquee las BackgroundTasks)
 from routers.login import Router_login
-from routers.recuperarcontraseña import router_recovery, limiter  # <-- Importación segura aquí
+from routers.recuperar_contrasena import router_recovery, limiter  # <-- Importación segura aquí
 from routers.asistencia import Router_asistencia
 from routers.ficha import Router_ficha
 from routers.carrera import Router_carrera

@@ -1,0 +1,1 @@
+VITE_API_URL=https://senaattendance-api.onrender.com
