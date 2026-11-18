@@ -1,0 +1,671 @@
+from datetime import date
+
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from pydantic import BaseModel
+from sqlmodel import Session, select
+
+from database import get_session
+
+from models.model import (
+    Asistencia,
+    Aprendiz,
+    Instructor,
+    Fichas,
+    FichaInstructor,
+    Competencia,
+    ResultadoAprendizaje,
+    EstadoAsistencia,
+    DiaSemana,
+)
+
+from .asistencia_calculo import calcular_estado
+from .asistencia_notificaciones import evaluar_y_notificar
+
+
+Router_asistencia = APIRouter(
+    prefix="/asistencia",
+    tags=["Asistencia"]
+)
+
+
+# =========================================================
+# SCHEMAS
+# =========================================================
+
+class RegistrarAsistenciaRequest(BaseModel):
+    Fec_Asi: date
+    Es_Asi: EstadoAsistencia
+
+    Id_Apr: int
+
+    Id_Fic: int
+    Id_Ins: int
+    Id_RA: int          # antes Id_Comp
+    Dia: DiaSemana
+
+
+# =========================================================
+# VALIDACIONES REUTILIZABLES
+# =========================================================
+
+_DIA_POR_WEEKDAY = {
+    0: DiaSemana.lunes,
+    1: DiaSemana.martes,
+    2: DiaSemana.miercoles,
+    3: DiaSemana.jueves,
+    4: DiaSemana.viernes,
+    5: DiaSemana.sabado,
+}
+
+
+def _verificar_ficha(session: Session, id_fic: int) -> Fichas:
+
+    ficha = session.get(Fichas, id_fic)
+
+    if not ficha:
+        raise HTTPException(status_code=404, detail="Ficha no encontrada")
+
+    return ficha
+
+
+def _verificar_aprendiz(session: Session, id_apr: int) -> Aprendiz:
+
+    aprendiz = session.get(Aprendiz, id_apr)
+
+    if not aprendiz:
+        raise HTTPException(status_code=404, detail="Aprendiz no encontrado")
+
+    return aprendiz
+
+
+def _verificar_pertenencia(aprendiz: Aprendiz, id_fic: int):
+
+    if aprendiz.Id_Fic != id_fic:
+        raise HTTPException(
+            status_code=400,
+            detail="El aprendiz no pertenece a esta ficha"
+        )
+
+
+def _verificar_periodo_ficha(ficha: Fichas, fecha: date):
+
+    if fecha < ficha.Fec_inicio_Fic:
+        raise HTTPException(
+            status_code=400,
+            detail="La fecha es anterior al inicio de la ficha"
+        )
+
+    if fecha > ficha.Fec_Fin_Fic:
+        raise HTTPException(
+            status_code=400,
+            detail="La fecha es posterior al fin de la ficha"
+        )
+
+def _verificar_periodo_ra(asignacion: FichaInstructor, fecha: date):
+
+    if not (asignacion.Fec_Inicio_RA <= fecha <= asignacion.Fec_Fin_RA):
+        raise HTTPException(
+            status_code=400,
+            detail="La fecha está fuera del período de este resultado de aprendizaje"
+        )
+
+
+def _verificar_dia_coincide(fecha: date, dia: DiaSemana):
+
+    esperado = _DIA_POR_WEEKDAY.get(fecha.weekday())
+
+    if esperado is None:
+        raise HTTPException(
+            status_code=400,
+            detail="No se registra asistencia los domingos"
+        )
+
+    if esperado != dia:
+        raise HTTPException(
+            status_code=400,
+            detail=f"La fecha {fecha} es {esperado.value}, no {dia.value}"
+        )
+
+
+def _obtener_ra_y_competencia(session: Session, id_ra: int):
+    """
+    Devuelve (resultado_aprendizaje, competencia).
+    La competencia se obtiene a través del resultado.
+    """
+    ra = session.get(ResultadoAprendizaje, id_ra)
+    competencia = session.get(Competencia, ra.Id_Comp) if ra else None
+    return ra, competencia
+
+def _armar_registros_ficha(session: Session, ficha: Fichas):
+    registros = session.exec(
+        select(Asistencia)
+        .where(Asistencia.Id_Fic == ficha.Id_Fic)
+        .order_by(Asistencia.Fec_Asi.desc())
+    ).all()
+
+    aprendices, instructores, ras = {}, {}, {}
+    resultado = []
+
+    for registro in registros:
+
+        if registro.Id_Apr not in aprendices:
+            aprendices[registro.Id_Apr] = session.get(Aprendiz, registro.Id_Apr)
+
+        if registro.Id_Ins not in instructores:
+            instructores[registro.Id_Ins] = session.get(Instructor, registro.Id_Ins)
+
+        if registro.Id_RA not in ras:
+            ras[registro.Id_RA] = _obtener_ra_y_competencia(session, registro.Id_RA)
+
+        aprendiz = aprendices[registro.Id_Apr]
+        instructor = instructores[registro.Id_Ins]
+        ra, competencia = ras[registro.Id_RA]
+
+        resultado.append({
+            "Id_Asi": registro.Id_Asi,
+            "Fec_Asi": registro.Fec_Asi,
+
+            "Id_Apr": registro.Id_Apr,
+            "Aprendiz": (
+                f"{aprendiz.Nom_Apr} {aprendiz.Ape_Apr}"
+                if aprendiz else "Aprendiz no encontrado"
+            ),
+            "Num_ide_Apr": aprendiz.Num_ide_Apr if aprendiz else None,
+
+            "Id_Fic": registro.Id_Fic,
+            "Num_Fic": ficha.Num_Fic,
+
+            "Id_Ins": registro.Id_Ins,
+            "Instructor": (
+                f"{instructor.Nom_Ins} {instructor.Ape_Ins}"
+                if instructor else "Instructor no encontrado"
+            ),
+
+            "Id_RA": registro.Id_RA,
+            "ResultadoAprendizaje": (
+                ra.Nom_RA if ra else "Resultado de aprendizaje no encontrado"
+            ),
+
+            "Id_Comp": ra.Id_Comp if ra else None,
+            "Competencia": (
+                competencia.Nom_Comp
+                if competencia
+                else "Competencia no encontrada"
+            ),
+
+            "Dia": registro.Dia.value if registro.Dia else None,
+            "Estado": registro.Es_Asi.value if registro.Es_Asi else None,
+        })
+
+    return resultado
+
+
+# =========================================================
+# OBTENER APRENDICES DE UNA FICHA
+# =========================================================
+
+@Router_asistencia.get("/ficha/{Id_Fic}/aprendices")
+def obtener_aprendices(
+    Id_Fic: int,
+    session: Session = Depends(get_session)
+):
+
+    _verificar_ficha(session, Id_Fic)
+
+    aprendices = session.exec(
+        select(Aprendiz)
+        .where(Aprendiz.Id_Fic == Id_Fic)
+        .order_by(Aprendiz.Ape_Apr, Aprendiz.Nom_Apr)
+    ).all()
+
+    return [
+        {
+            "Id_Apr": aprendiz.Id_Apr,
+            "Nom_Apr": aprendiz.Nom_Apr,
+            "Ape_Apr": aprendiz.Ape_Apr,
+            "Num_ide_Apr": aprendiz.Num_ide_Apr
+        }
+        for aprendiz in aprendices
+    ]
+
+
+# =========================================================
+# OBTENER ASIGNACIONES DEL INSTRUCTOR
+# =========================================================
+
+@Router_asistencia.get("/instructor/{Id_Ins}/asignaciones")
+def obtener_asignaciones_instructor(
+    Id_Ins: int,
+    session: Session = Depends(get_session)
+):
+    relaciones = session.exec(
+        select(FichaInstructor)
+        .where(FichaInstructor.Id_Ins == Id_Ins)
+    ).all()
+
+    resultado = []
+
+    for relacion in relaciones:
+        ficha = session.get(Fichas, relacion.Id_Fic)
+        ra, competencia = _obtener_ra_y_competencia(session, relacion.Id_RA)
+
+        if not ficha:
+            continue
+
+        resultado.append({
+            "Id_Fic": relacion.Id_Fic,
+            "Id_Ins": relacion.Id_Ins,
+            "Id_RA": relacion.Id_RA,
+            "Id_Comp": ra.Id_Comp if ra else None,
+
+            "Dia": (
+                relacion.Dia.value
+                if relacion.Dia
+                else None
+            ),
+
+            "Num_Fic": ficha.Num_Fic,
+
+            "Jor_Fic": (
+                ficha.Jor_Fic.value
+                if ficha.Jor_Fic
+                else None
+            ),
+
+            # PERÍODO DE LA FICHA
+            "Fec_inicio_Fic": ficha.Fec_inicio_Fic,
+            "Fec_Fin_Fic": ficha.Fec_Fin_Fic,
+
+            # PERÍODO DEL RESULTADO DE APRENDIZAJE
+            "Fec_Inicio_RA": relacion.Fec_Inicio_RA,
+            "Fec_Fin_RA": relacion.Fec_Fin_RA,
+
+            # RESULTADO DE APRENDIZAJE Y COMPETENCIA
+            "ResultadoAprendizaje": ra.Nom_RA if ra else None,
+            "Competencia": competencia.Nom_Comp if competencia else None,
+        })
+
+    return resultado
+
+
+# =========================================================
+# OBTENER ASISTENCIA DE UNA CLASE
+# =========================================================
+
+@Router_asistencia.get("/clase/{Id_Fic}/{Id_Ins}/{Id_RA}/{Dia}/{Fec_Asi}")
+def obtener_asistencia_clase(
+    Id_Fic: int,
+    Id_Ins: int,
+    Id_RA: int,
+    Dia: DiaSemana,
+    Fec_Asi: date,
+    session: Session = Depends(get_session)
+):
+
+    asignacion = session.get(
+        FichaInstructor, (Id_Fic, Id_Ins, Id_RA, Dia)
+    )
+
+    if not asignacion:
+        raise HTTPException(
+            status_code=404,
+            detail="La asignación de esta clase no existe"
+        )
+
+    ficha = _verificar_ficha(session, Id_Fic)
+    _verificar_periodo_ficha(ficha, Fec_Asi)
+
+    aprendices = session.exec(
+        select(Aprendiz)
+        .where(Aprendiz.Id_Fic == Id_Fic)
+        .order_by(Aprendiz.Ape_Apr, Aprendiz.Nom_Apr)
+    ).all()
+
+    asistencias = session.exec(
+        select(Asistencia)
+        .where(
+            Asistencia.Fec_Asi == Fec_Asi,
+            Asistencia.Id_Fic == Id_Fic,
+            Asistencia.Id_Ins == Id_Ins,
+            Asistencia.Id_RA == Id_RA,
+            Asistencia.Dia == Dia
+        )
+    ).all()
+
+    asistencias_map = {a.Id_Apr: a for a in asistencias}
+
+    resultado = []
+
+    for aprendiz in aprendices:
+
+        asistencia = asistencias_map.get(aprendiz.Id_Apr)
+
+        resultado.append({
+            "Id_Apr": aprendiz.Id_Apr,
+            "Nom_Apr": aprendiz.Nom_Apr,
+            "Ape_Apr": aprendiz.Ape_Apr,
+            "Num_ide_Apr": aprendiz.Num_ide_Apr,
+            "Id_Asi": asistencia.Id_Asi if asistencia else None,
+            "Es_Asi": asistencia.Es_Asi.value if asistencia else None,
+        })
+
+    return resultado
+
+
+# =========================================================
+# OBTENER ESTADO / SEMÁFORO DE UN APRENDIZ
+# =========================================================
+
+@Router_asistencia.get("/aprendiz/{Id_Apr}/estado")
+def obtener_estado_aprendiz(
+    Id_Apr: int,
+    session: Session = Depends(get_session)
+):
+
+    aprendiz = _verificar_aprendiz(session, Id_Apr)
+
+    if not aprendiz.Id_Fic:
+        raise HTTPException(
+            status_code=400,
+            detail="El aprendiz no pertenece a ninguna ficha"
+        )
+
+    return calcular_estado(session, Id_Apr, aprendiz.Id_Fic)
+
+# =========================================================
+# LISTAR FALLAS / NOVEDADES DE UN APRENDIZ
+# =========================================================
+
+@Router_asistencia.get("/aprendiz/{Id_Apr}/novedades")
+def obtener_novedades_aprendiz(
+    Id_Apr: int,
+    session: Session = Depends(get_session)
+):
+    aprendiz = _verificar_aprendiz(session, Id_Apr)
+
+    if not aprendiz.Id_Fic:
+        raise HTTPException(
+            status_code=400,
+            detail="El aprendiz no pertenece a ninguna ficha"
+        )
+
+    ficha = _verificar_ficha(session, aprendiz.Id_Fic)
+
+    registros = session.exec(
+        select(Asistencia)
+        .where(
+            Asistencia.Id_Apr == Id_Apr,
+            Asistencia.Id_Fic == aprendiz.Id_Fic,
+            Asistencia.Es_Asi.in_([
+                EstadoAsistencia.falla,
+                EstadoAsistencia.excusa,
+                EstadoAsistencia.retardo,
+            ]),
+        )
+        .order_by(Asistencia.Fec_Asi.desc())
+    ).all()
+
+    resultado = []
+    instructores = {}
+
+    for registro in registros:
+
+        ra, competencia = _obtener_ra_y_competencia(session, registro.Id_RA)
+
+        if registro.Id_Ins not in instructores:
+            instructores[registro.Id_Ins] = session.get(
+                Instructor, registro.Id_Ins
+            )
+
+        instructor = instructores[registro.Id_Ins]
+
+        resultado.append({
+            "Id_Asi": registro.Id_Asi,
+            "Fec_Asi": registro.Fec_Asi,
+            "Es_Asi": registro.Es_Asi.value,
+            "Num_Fic": ficha.Num_Fic,
+            "ResultadoAprendizaje": ra.Nom_RA if ra else None,
+            "Competencia": competencia.Nom_Comp if competencia else None,
+            "Instructor": (
+                f"{instructor.Nom_Ins} {instructor.Ape_Ins}"
+                if instructor else None
+            ),
+        })
+
+    return resultado
+# =========================================================
+# REGISTRAR / ACTUALIZAR ASISTENCIA
+# =========================================================
+
+@Router_asistencia.post("", status_code=status.HTTP_201_CREATED)
+def registrar_asistencia(
+    data: RegistrarAsistenciaRequest,
+    background: BackgroundTasks,
+    session: Session = Depends(get_session)
+):
+
+    ficha = _verificar_ficha(session, data.Id_Fic)
+    aprendiz = _verificar_aprendiz(session, data.Id_Apr)
+
+    _verificar_pertenencia(aprendiz, data.Id_Fic)
+    _verificar_dia_coincide(data.Fec_Asi, data.Dia)
+    _verificar_periodo_ficha(ficha, data.Fec_Asi)
+
+    asignacion = session.get(
+        FichaInstructor,
+        (data.Id_Fic, data.Id_Ins, data.Id_RA, data.Dia)
+    )
+
+    if not asignacion:
+        raise HTTPException(
+            status_code=404,
+            detail="La asignación de este resultado de aprendizaje no existe"
+        )
+
+    _verificar_periodo_ra(asignacion, data.Fec_Asi)
+
+    asistencia = session.exec(
+        select(Asistencia)
+        .where(
+            Asistencia.Fec_Asi == data.Fec_Asi,
+            Asistencia.Id_Apr == data.Id_Apr,
+            Asistencia.Id_Fic == data.Id_Fic,
+            Asistencia.Id_Ins == data.Id_Ins,
+            Asistencia.Id_RA == data.Id_RA,
+            Asistencia.Dia == data.Dia
+        )
+    ).first()
+
+    mensaje = "Asistencia actualizada correctamente"
+
+    if asistencia:
+        asistencia.Es_Asi = data.Es_Asi
+    else:
+        asistencia = Asistencia(**data.model_dump())
+        mensaje = "Asistencia registrada correctamente"
+
+    session.add(asistencia)
+    session.commit()
+    session.refresh(asistencia)
+
+    estado = calcular_estado(session, data.Id_Apr, data.Id_Fic)
+    evaluar_y_notificar(session, background, aprendiz, ficha, estado)
+
+    return {
+        "mensaje": mensaje,
+        "asistencia": asistencia,
+        "estado": estado,
+    }
+
+
+# =========================================================
+# ALERTAS DEL INSTRUCTOR
+# =========================================================
+
+@Router_asistencia.get("/instructor/{Id_Ins}/alertas")
+def obtener_alertas_instructor(
+    Id_Ins: int,
+    session: Session = Depends(get_session)
+):
+
+    fichas_ids = session.exec(
+        select(FichaInstructor.Id_Fic)
+        .where(FichaInstructor.Id_Ins == Id_Ins)
+        .distinct()
+    ).all()
+
+    total_alertas = 0
+    ya_contados = set()
+
+    for id_fic in fichas_ids:
+
+        aprendices = session.exec(
+            select(Aprendiz).where(Aprendiz.Id_Fic == id_fic)
+        ).all()
+
+        for aprendiz in aprendices:
+
+            if aprendiz.Id_Apr in ya_contados:
+                continue
+
+            estado = calcular_estado(session, aprendiz.Id_Apr, id_fic)
+
+            if estado["deserta_por_racha"] or estado["deserta_por_acumulado"]:
+                total_alertas += 1
+
+            ya_contados.add(aprendiz.Id_Apr)
+
+    return {"total_alertas": total_alertas}
+
+
+# =========================================================
+# REVISAR ASISTENCIA GENERAL DE UNA FICHA
+# =========================================================
+
+@Router_asistencia.get("/instructor/{Id_Ins}/revisar/{Id_Fic}")
+def revisar_asistencia_ficha(
+    Id_Ins: int, 
+    Id_Fic: int, 
+    session: Session = Depends(get_session)
+):
+    # 1. Validar que la ficha exista
+    ficha = _verificar_ficha(session, Id_Fic)
+    
+    # 2. Validar que el instructor esté asignado a la ficha
+    asignacion_instructor = session.exec(
+        select(FichaInstructor)
+        .where(
+            FichaInstructor.Id_Ins == Id_Ins, 
+            FichaInstructor.Id_Fic == Id_Fic
+        )
+    ).first()
+    
+    if not asignacion_instructor:
+        raise HTTPException(
+            status_code=403, 
+            detail="No tienes asignación en esta ficha"
+        )
+    
+    # 3. Obtener los registros de asistencia de la ficha
+    registros = session.exec(
+        select(Asistencia)
+        .where(Asistencia.Id_Fic == Id_Fic)
+        .order_by(Asistencia.Fec_Asi.desc())
+    ).all()
+    
+    resultado = []
+    
+    # 4. Mapear y construir la respuesta
+    for registro in registros:
+        aprendiz = session.get(Aprendiz, registro.Id_Apr)
+        ra, competencia = _obtener_ra_y_competencia(session, registro.Id_RA)
+        instructor = session.get(Instructor, registro.Id_Ins)
+        
+        resultado.append({
+            "Id_Asi": registro.Id_Asi,
+            "Fec_Asi": registro.Fec_Asi,
+            "Id_Apr": registro.Id_Apr,
+            "Aprendiz": f"{aprendiz.Nom_Apr} {aprendiz.Ape_Apr}" if aprendiz else "Aprendiz no encontrado",
+            "Num_ide_Apr": aprendiz.Num_ide_Apr if aprendiz else None,
+            "Id_Fic": registro.Id_Fic,
+            "Num_Fic": ficha.Num_Fic,
+            "Id_Ins": registro.Id_Ins,
+            "Instructor": f"{instructor.Nom_Ins} {instructor.Ape_Ins}" if instructor else "Instructor no encontrado",
+            
+            # Resultado de aprendizaje
+            "Id_RA": registro.Id_RA,
+            "ResultadoAprendizaje": ra.Nom_RA if ra else "Resultado de aprendizaje no encontrado",
+            
+            # Competencia (derivada del resultado)
+            "Id_Comp": ra.Id_Comp if ra else None,
+            "Competencia": competencia.Nom_Comp if competencia else "Competencia no encontrada",
+            
+            "Dia": registro.Dia.value if registro.Dia else None,
+            "Estado": registro.Es_Asi.value if registro.Es_Asi else None,
+        })
+        
+    return resultado
+
+# =========================================================
+# APRENDIZ: ASISTENCIA GENERAL DE SU FICHA
+# =========================================================
+
+@Router_asistencia.get("/aprendiz/{Id_Apr}/ficha")
+def revisar_asistencia_aprendiz(
+    Id_Apr: int,
+    session: Session = Depends(get_session)
+):
+    aprendiz = _verificar_aprendiz(session, Id_Apr)
+
+    if not aprendiz.Id_Fic:
+        raise HTTPException(
+            status_code=400,
+            detail="El aprendiz no pertenece a ninguna ficha"
+        )
+
+    ficha = _verificar_ficha(session, aprendiz.Id_Fic)
+
+    registros = _armar_registros_ficha(session, ficha)
+
+    # Los compañeros no deben ver el documento de los demás
+    for registro in registros:
+        registro.pop("Num_ide_Apr", None)
+
+    return {
+        "ficha": {
+            "Id_Fic": ficha.Id_Fic,
+            "Num_Fic": ficha.Num_Fic,
+        },
+        "registros": registros,
+    }
+
+# =========================================================
+# COORDINADOR: TODAS LAS FICHAS
+# =========================================================
+
+@Router_asistencia.get("/coordinador/fichas")
+def listar_fichas_coordinador(
+    session: Session = Depends(get_session)
+):
+    fichas = session.exec(
+        select(Fichas).order_by(Fichas.Num_Fic)
+    ).all()
+
+    return [
+        {
+            "Id_Fic": ficha.Id_Fic,
+            "Num_Fic": ficha.Num_Fic,
+            "Jor_Fic": ficha.Jor_Fic.value if ficha.Jor_Fic else None,
+        }
+        for ficha in fichas
+    ]
+
+
+@Router_asistencia.get("/coordinador/ficha/{Id_Fic}")
+def revisar_asistencia_coordinador(
+    Id_Fic: int,
+    session: Session = Depends(get_session)
+):
+    ficha = _verificar_ficha(session, Id_Fic)
+
+    return _armar_registros_ficha(session, ficha)
